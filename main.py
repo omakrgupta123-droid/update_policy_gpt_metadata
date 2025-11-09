@@ -326,7 +326,7 @@ Context:
 # STREAMLIT UI
 # -------------------------------------------------------------
 st.set_page_config(page_title="PolicyGPT RAG System", layout="wide")
-st.title("📘 PolicyGPT — PDF → Metadata → S3 Vector → RAG Chat")
+st.title("📘 EDME PolicyGPT")
 
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -429,4 +429,5 @@ if user_input:
             st.markdown(rag_response)
 
     st.session_state.chat_history.append({"role": "assistant", "content": rag_response})
+
 

@@ -6,6 +6,5 @@ flask
 langchain
 streamlit
 python-dotenv
-pydf2
 tiktoken
 streamlit-option-menu

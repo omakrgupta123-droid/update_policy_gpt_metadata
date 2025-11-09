@@ -408,7 +408,7 @@ with left:
         )
 
 with right:
-    st.header("💬 RAG Chat Interface")
+    st.header("")
     for chat in st.session_state.chat_history:
         with st.chat_message(chat["role"]):
             st.markdown(chat["content"])
@@ -429,3 +429,4 @@ if user_input:
             st.markdown(rag_response)
 
     st.session_state.chat_history.append({"role": "assistant", "content": rag_response})
+

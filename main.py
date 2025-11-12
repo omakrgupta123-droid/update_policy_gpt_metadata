@@ -1,30 +1,38 @@
 import streamlit as st
-import boto3
 import os
 import time
 import json
+import re
+import boto3
 import pandas as pd
-import numpy as np
 from datetime import datetime
 from dotenv import load_dotenv
-from botocore.exceptions import ClientError
 import openai
+import random
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# -------------------------------------------------------------
+# ------------------------------
 # Load Environment Variables
-# -------------------------------------------------------------
+# ------------------------------
 load_dotenv()
-
 AWS_REGION = os.getenv("AWS_REGION_US")
 AWS_REGION_NAME = os.getenv("AWS_REGION_NAME")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID_PolicyGPT")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY_PolicyGPT")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+BUCKET_NAME = "edme-apps-data-dev"
+PREFIX = "policygpt/"
+VECTOR_INDEX_ARN = "arn:aws:s3vectors:us-east-1:437639050237:bucket/edmeapps-vector-dev/index/policy-gpt-index-two"
+
+# ------------------------------
+# Initialize OpenAI
+# ------------------------------
 openai.api_key = OPENAI_API_KEY
 
-# -------------------------------------------------------------
-# AWS Clients
-# -------------------------------------------------------------
+# ------------------------------
+# Initialize AWS clients
+# ------------------------------
 s3 = boto3.client(
     "s3",
     region_name=AWS_REGION,
@@ -39,25 +47,18 @@ textract = boto3.client(
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
 )
 
-s3vector = boto3.client(
+s3vectors = boto3.client(
     "s3vectors",
     region_name=AWS_REGION,
     aws_access_key_id=AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY
 )
 
-# -------------------------------------------------------------
-# Constants
-# -------------------------------------------------------------
-BUCKET_NAME = "edme-apps-data-dev"
-PREFIX = "policygpt/"
-VECTOR_INDEX_ARN = "arn:aws:s3vectors:us-east-1:437639050237:bucket/edmeapps-vector-dev/index/policy-gpt-index-two"
-
-# -------------------------------------------------------------
+# ------------------------------
 # Helper Functions
-# -------------------------------------------------------------
+# ------------------------------
+
 def extract_text_from_pdf(bucket, s3_key):
-    """Extract text from PDF using AWS Textract."""
     try:
         response = textract.start_document_text_detection(
             DocumentLocation={"S3Object": {"Bucket": bucket, "Name": s3_key}}
@@ -76,29 +77,105 @@ def extract_text_from_pdf(bucket, s3_key):
         pages = {}
         next_token = None
         while True:
-            if next_token:
-                response = textract.get_document_text_detection(JobId=job_id, NextToken=next_token)
-            else:
-                response = textract.get_document_text_detection(JobId=job_id)
-
-            for block in response.get("Blocks", []):
+            resp = textract.get_document_text_detection(JobId=job_id, NextToken=next_token) if next_token else textract.get_document_text_detection(JobId=job_id)
+            for block in resp.get("Blocks", []):
                 if block.get("BlockType") == "LINE":
                     page_num = block.get("Page", 1)
                     pages.setdefault(page_num, []).append(block.get("Text", ""))
-
-            next_token = response.get("NextToken")
+            next_token = resp.get("NextToken")
             if not next_token:
                 break
 
         page_texts = ["\n".join(pages[p]) for p in sorted(pages.keys())]
         return page_texts, None
-
     except Exception as e:
         return None, str(e)
 
+# def semantic_hierarchical_chunking(page_text, page_num, file_name):
+#     """
+#     Structure-aware semantic chunking that breaks text into meaningful sections
+#     based on semantic boundaries and hierarchical structure
+#     """
+#     chunks = []
+    
+#     # Split by common section patterns in insurance documents
+#     section_patterns = [
+#         r'\n(?=[A-Z][A-Z\s]{10,})\n',  # All caps headers
+#         r'\n(?=\d+\.\s+[A-Z])',  # Numbered sections
+#         r'\n(?=[A-Z][a-z]+:)',  # Titled sections with colons
+#         r'\n(?=SECTION|ARTICLE|CLAUSE|COVERAGE|TERMS|CONDITIONS|DEFINITIONS)',  # Common keywords
+#         r'\n\n+',  # Paragraph breaks
+#     ]
+    
+#     # Try splitting by patterns in order of hierarchy
+#     sections = [page_text]
+#     for pattern in section_patterns:
+#         new_sections = []
+#         for section in sections:
+#             parts = re.split(pattern, section)
+#             new_sections.extend([p.strip() for p in parts if p.strip()])
+#         sections = new_sections
+    
+#     # Create semantic chunks with overlap for context preservation
+#     chunk_size = 800  # characters
+#     overlap = 200  # characters for context continuity
+    
+#     for section in sections:
+#         if len(section) <= chunk_size:
+#             chunks.append({
+#                 'text': section,
+#                 'type': 'section'
+#             })
+#         else:
+#             # Split large sections with overlap
+#             start = 0
+#             while start < len(section):
+#                 end = start + chunk_size
+#                 chunk_text = section[start:end]
+                
+#                 # Try to break at sentence boundary
+#                 if end < len(section):
+#                     last_period = chunk_text.rfind('.')
+#                     last_newline = chunk_text.rfind('\n')
+#                     break_point = max(last_period, last_newline)
+#                     if break_point > chunk_size * 0.7:  # At least 70% of chunk size
+#                         chunk_text = chunk_text[:break_point + 1]
+#                         end = start + break_point + 1
+                
+#                 chunks.append({
+#                     'text': chunk_text.strip(),
+#                     'type': 'subsection'
+#                 })
+                
+#                 start = end - overlap
+    
+#     return chunks
+
+def recursive_chunk_with_langchain(page_text, page_num, file_name):
+    """
+    Use LangChain's RecursiveCharacterTextSplitter for improved chunking
+    """
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+        length_function=len,
+        separators=["\n\n", "\n", ". ", " ", ""]
+    )
+    
+    chunks = text_splitter.split_text(page_text)
+    
+    chunk_records = []
+    for idx, chunk in enumerate(chunks):
+        chunk_records.append({
+            'text': chunk,
+            'chunk_index': idx,
+            'page_number': page_num,
+            'file_name': file_name
+        })
+    
+    return chunk_records
 
 def extract_metadata_llm(page_text, file_name):
-    """Extract metadata from text using GPT-4o."""
     prompt = f"""
 You are an expert data extraction model.
 Extract structured insurance policy metadata from the text below.
@@ -127,8 +204,7 @@ Output JSON:
         end = content.rfind("}")
         if start == -1 or end == -1:
             raise ValueError("No JSON returned from LLM")
-        json_str = content[start:end+1]
-        data = json.loads(json_str)
+        data = json.loads(content[start:end+1])
         return {
             "policy_number": data.get("policy_number"),
             "policy_type": data.get("policy_type"),
@@ -137,16 +213,9 @@ Output JSON:
         }
     except Exception as e:
         st.warning(f"Metadata extraction failed for {file_name}: {e}")
-        return {
-            "policy_number": None,
-            "policy_type": None,
-            "client_name": None,
-            "client_type": None
-        }
-
+        return {"policy_number": None, "policy_type": None, "client_name": None, "client_type": None}
 
 def generate_embedding(text):
-    """Generate embeddings using OpenAI API."""
     try:
         emb = openai.embeddings.create(
             model="text-embedding-3-large",
@@ -157,277 +226,357 @@ def generate_embedding(text):
         st.warning(f"Embedding failed: {e}")
         return None
 
-
 def store_vector_with_metadata(vector, metadata_record):
-    """Store embedding vector + metadata in AWS S3 Vector Index."""
     try:
         if not vector:
             return False, "No embedding found"
-
         vector_id = f"{metadata_record['file_name']}::{metadata_record['page_number']}::{int(time.time())}"
-
-        s3vector.put_vectors(
+        slim_metadata = {
+            "file_name": metadata_record["file_name"],
+            "page_number": metadata_record["page_number"],
+            "policy_number": metadata_record.get("policy_number"),
+            "policy_type": metadata_record.get("policy_type"),
+            "client_name": metadata_record.get("client_name"),
+            "client_type": metadata_record.get("client_type"),
+            "timestamp": metadata_record.get("timestamp"),
+            "text": metadata_record.get("text")
+        }
+        s3vectors.put_vectors(
             indexArn=VECTOR_INDEX_ARN,
-            vectors=[
-                {
-                    "key": vector_id,
-                    "data": {"float32": vector},
-                    "metadata": metadata_record
-                }
-            ]
+            vectors=[{"key": vector_id, "data": {"float32": vector}, "metadata": slim_metadata}]
         )
         return True, vector_id
     except Exception as e:
         return False, str(e)
 
+# ------------------------------
+# SESSION-BASED RAG Helper Functions
+# ------------------------------
+def get_query_embedding(text):
+    response = openai.embeddings.create(
+        model="text-embedding-3-large",
+        input=text
+    )
+    return response.data[0].embedding
 
-# -------------------------------------------------------------
-# RAG - Vector Search
-# -------------------------------------------------------------
-def _cosine_similarity_matrix(emb_matrix, query_vec):
-    """Compute cosine similarity between matrix (n x d) and single vector (d)."""
-    emb_norms = np.linalg.norm(emb_matrix, axis=1)
-    q_norm = np.linalg.norm(query_vec)
-    emb_norms[emb_norms == 0] = 1e-12
-    if q_norm == 0:
-        q_norm = 1e-12
-    sims = (emb_matrix @ query_vec) / (emb_norms * q_norm)
-    return sims
+def retrieve_documents_from_session(query, session_chunks, top_k=10):
+    """
+    Retrieve documents from current session only using cosine similarity
+    """
+    query_vector = get_query_embedding(query)
+    
+    # Calculate cosine similarity for each chunk
+    results = []
+    for chunk in session_chunks:
+        if chunk.get('vector'):
+            # Cosine similarity
+            dot_product = sum(a * b for a, b in zip(query_vector, chunk['vector']))
+            query_norm = sum(a * a for a in query_vector) ** 0.5
+            chunk_norm = sum(a * a for a in chunk['vector']) ** 0.5
+            similarity = dot_product / (query_norm * chunk_norm)
+            
+            results.append({
+                'chunk': chunk,
+                'similarity': similarity,
+                'text': chunk['text'],
+                'metadata': {
+                    'file_name': chunk['file_name'],
+                    'page_number': chunk['page_number'],
+                    'chunk_index': chunk.get('chunk_index', 0)
+                }
+            })
+    
+    # Sort by similarity (higher is better)
+    results.sort(key=lambda x: x['similarity'], reverse=True)
+    
+    return results[:top_k]
 
+def retrieve_documents(query, top_k=10):
+    query_vector = get_query_embedding(query)
+    response = s3vectors.query_vectors(
+        indexArn=VECTOR_INDEX_ARN,
+        queryVector={"float32": query_vector},
+        topK=top_k,
+        returnDistance=True,
+        returnMetadata=True
+    )
+    results = response.get("vectors", [])
+    docs = []
+    for r in results:
+        meta = r.get("metadata", {})
+        text_snippet = meta.get("text", "")
+        docs.append({
+            "key": r.get("key"),
+            "distance": r.get("distance"),
+            "text": text_snippet,
+            "metadata": meta
+        })
+    return docs
 
-def retrieve_relevant_chunks(query, top_k=3):
-    q_emb = generate_embedding(query)
-    if not q_emb:
-        return []
+def extract_numbers_from_docs(docs):
+    numbers = []
+    for doc in docs:
+        # Extract all numbers including decimals and currency formats
+        text = doc.get('text', '')
+        raw_numbers = re.findall(r'\b\d+(?:,\d{3})*(?:\.\d+)?\b', text)
+        # Convert to float and clean commas
+        for num_str in raw_numbers:
+            try:
+                clean_num = float(num_str.replace(',', ''))
+                if clean_num > 0:
+                    numbers.append(clean_num)
+            except:
+                pass
+    return numbers
 
-    try:
-        if hasattr(s3vector, "query"):
-            resp = s3vector.query(
-                indexArn=VECTOR_INDEX_ARN,
-                queryVector={"float32": q_emb},
-                topK=top_k,
-                includeMetadata=True
-            )
-            matches = resp.get("matches", [])
-            normalized = []
-            for m in matches:
-                meta = m.get("metadata", {})
-                score = m.get("score", None) or m.get("distance", None) or 0.0
-                normalized.append({"metadata": meta, "score": score})
-            return normalized
-    except Exception as e:
-        st.warning(f"Server-side vector query failed or unavailable, falling back to local retrieval: {e}")
+def generate_answer_from_session(query, docs, numbers, uploaded_files):
+    """
+    Generate answer using only current session documents
+    """
+    # Build detailed context with citations
+    context_parts = []
+    for idx, d in enumerate(docs, 1):
+        metadata = d.get('metadata', {})
+        page_num = metadata.get('page_number', 'Unknown')
+        file_name = metadata.get('file_name', 'Unknown')
+        similarity = d.get('similarity', 'N/A')
+        
+        context_parts.append(f"""
+[Citation {idx}] - Page {page_num} of {file_name} (Similarity Score: {similarity})
+Content: {d['text'][:1000]}
+""")
+    
+    context = "\n".join(context_parts)
+    numbers_summary = f"All extracted numbers from documents: {numbers}" if numbers else "No numerical values found."
+    
+    # Add session file information
+    session_files_info = f"\n\nCURRENT SESSION UPLOADED FILES: {', '.join(uploaded_files)}"
+    
+    prompt = f"""
+You are a helpful and accurate policy assistant. Use ONLY the retrieved documents from the CURRENT SESSION below to answer the user's query.
 
-    local_records = st.session_state.get("metadata", []) or []
-    vectors = []
-    metadatas = []
-    for rec in local_records:
-        vec = rec.get("vector")
-        if vec and isinstance(vec, (list, tuple)) and len(vec) > 0:
-            vectors.append(np.array(vec, dtype=float))
-            metadatas.append(rec)
+CRITICAL INSTRUCTIONS:
+1. You can ONLY reference documents uploaded in the CURRENT SESSION: {', '.join(uploaded_files)}
+2. If the user asks "Which file did I upload?" or similar questions, list ONLY these files: {', '.join(uploaded_files)}
+3. Provide accurate information based ONLY on the documents provided below
+4. Include ALL relevant numbers, amounts, dates, and percentages from the documents
+5. When mentioning information, ALWAYS cite the source using [Citation X] format
+6. If multiple citations support the same point, list all of them like [Citation 1, 2]
+7. Do not make up or assume any information not present in the documents
+8. If the answer is not in the documents, clearly state that
+9. NEVER reference any documents not in the current session list above
 
-    if not vectors:
-        return []
+Retrieved Documents from Current Session:
+{context}
 
-    emb_matrix = np.vstack(vectors)
-    q_vec = np.array(q_emb, dtype=float)
-    sims = _cosine_similarity_matrix(emb_matrix, q_vec)
-    top_k = min(top_k, len(sims))
-    top_idx = np.argsort(-sims)[:top_k]
+{numbers_summary}
+{session_files_info}
 
-    matches = []
-    for idx in top_idx:
-        matches.append({"metadata": metadatas[int(idx)], "score": float(sims[int(idx)])})
-    return matches
+User Query: {query}
 
+Answer (with citations):"""
+    
+    response = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": f"You are a knowledgeable policy assistant that answers questions based ONLY on documents from the current session. Current session files: {', '.join(uploaded_files)}. Never reference documents outside this list."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.1
+    )
+    return response.choices[0].message.content
 
-# -------------------------------------------------------------
-# DYNAMIC RAG RESPONSE LOGIC
-# -------------------------------------------------------------
-def generate_rag_response(model_name, query):
-    """Generate context-aware, dynamically detailed RAG response."""
-    matches = retrieve_relevant_chunks(query, top_k=4)
+def generate_answer(query, docs, numbers):
+    # Build detailed context with citations
+    context_parts = []
+    for idx, d in enumerate(docs, 1):
+        page_num = d['metadata'].get('page_number', 'Unknown')
+        file_name = d['metadata'].get('file_name', 'Unknown')
+        distance = d.get('distance', 'N/A')
+        
+        context_parts.append(f"""
+[Citation {idx}] - Page {page_num} of {file_name} (Relevance Score: {distance})
+Content: {d['text'][:1000]}
+""")
+    
+    context = "\n".join(context_parts)
+    numbers_summary = f"All extracted numbers from documents: {numbers}" if numbers else "No numerical values found."
+    
+    prompt = f"""
+You are a helpful and accurate policy assistant. Use the retrieved documents below to answer the user's query.
 
-    if not matches:
-        context_text = "No relevant context found in the vector database."
-    else:
-        pieces = []
-        for m in matches:
-            md = m["metadata"]
-            page_info = f"(file: {md.get('file_name')}, page: {md.get('page_number')}, score: {m.get('score'):.4f})"
-            text_snippet = md.get("text", "")
-            pieces.append(f"{page_info}\n{text_snippet}")
-        combined_context = "\n\n---\n\n".join(pieces)
+IMPORTANT INSTRUCTIONS:
+1. Provide accurate information based ONLY on the documents provided
+2. Include ALL relevant numbers, amounts, dates, and percentages from the documents
+3. When mentioning information, ALWAYS cite the source using [Citation X] format
+4. If multiple citations support the same point, list all of them like [Citation 1, 2]
+5. Do not make up or assume any information not present in the documents
+6. If the answer is not in the documents, clearly state that
 
-    # Detect if user wants detailed or summary output
-    query_lower = query.lower()
-    if any(word in query_lower for word in ["detail", "summary", "explain fully", "comprehensive"]):
-        detail_level = "detailed"
-    else:
-        detail_level = "concise"
+Retrieved Documents:
+{context}
 
-    if detail_level == "detailed":
-        prompt = f"""
-You are a professional insurance document analyst.
+{numbers_summary}
 
-Analyze the provided PDF context and answer the user’s question clearly and accurately.
-Identify the policyholder, policy number, and key policy details.
+User Query: {query}
 
-------
-**Question:** {query}
-------
-**Context Extracted from PDFs:**
-{combined_context}
-------
+Answer (with citations):"""
+    
+    response = openai.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are a knowledgeable policy assistant that always provides accurate, well-cited answers based on source documents."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.1
+    )
+    return response.choices[0].message.content
 
-**Response Format:**
-1. Begin with a one-line summary (e.g., “The policy for [Client Name] (Policy No. …) covers the following risks.”)
-2. Present organized details by state or region using icons:
-   - 🏭 Industrial zones  
-   - ⚓ Ports  
-   - ⚙️ Manufacturing / production  
-   - 🛢️ Tank / chemical terminals  
-3. Use clean Markdown bullet points — one location per line.
-4. Add a **💡 Summary** section:
-   - Total risk sites  
-   - States covered  
-   - Nature of risk (if mentioned)  
-   - Sum insured (if available)
-5. End with a brief **Conclusion** (1–2 lines).
+# ------------------------------
+# Streamlit UI
+# ------------------------------
+st.set_page_config(page_title="Policy GPT", layout="wide")
+st.title("📘 Policy GPT — Upload PDF & Query")
 
-Be concise, factual, and neatly formatted.
-"""
-    else:
-        prompt = f"""
-You are a professional insurance assistant.
-Provide a short, direct answer (2–3 lines maximum) to the user’s question
-based only on the context below.
-
-Question: {query}
-
-Context:
-{combined_context}
-"""
-
-    try:
-        response = openai.chat.completions.create(
-            model=model_name,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=800 if detail_level == "detailed" else 300
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        return f"RAG response failed: {e}"
-
-
-# -------------------------------------------------------------
-# STREAMLIT UI
-# -------------------------------------------------------------
-st.set_page_config(page_title="PolicyGPT RAG System", layout="wide")
-st.title("📘 EDME PolicyGPT")
-
+# Sidebar
 with st.sidebar:
-    st.header("⚙️ Settings")
-    model_choice = st.selectbox("Select LLM Model", ["gpt-4", "gpt-4o"])
-    st.markdown("---")
-    st.caption("This app processes PDFs, extracts metadata & embeddings, and allows RAG-based querying.")
+    st.header("Upload PDF")
+    uploaded_file = st.file_uploader("Choose a PDF file to upload", type=["pdf"])
 
+# Initialize session state
 if "metadata" not in st.session_state:
     st.session_state.metadata = []
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+if "processed_file" not in st.session_state:
+    st.session_state.processed_file = None
+if "session_chunks" not in st.session_state:
+    st.session_state.session_chunks = []
+if "uploaded_files" not in st.session_state:
+    st.session_state.uploaded_files = []
 
-left, right = st.columns([1, 1])
-
-with left:
-    st.header("📤 Upload PDF")
-    uploaded_file = st.file_uploader("Choose a PDF file", type=["pdf"])
-
-    if uploaded_file:
-        file_name = uploaded_file.name
+# ------------------------------
+# Upload PDF and process (ONLY if new file uploaded)
+# ------------------------------
+if uploaded_file and (st.session_state.processed_file != uploaded_file.name):
+    file_name = uploaded_file.name
+    with st.spinner("📤 Uploading and processing PDF..."):
         s3_key = f"{PREFIX}{file_name}"
+        try:
+            s3.upload_fileobj(uploaded_file, BUCKET_NAME, s3_key)
+            st.success("✅ File uploaded to S3 successfully!")
+        except Exception as e:
+            st.error(f"Upload failed: {e}")
+            st.stop()
 
-        with st.spinner("📤 Uploading and processing PDF..."):
-            try:
-                s3.upload_fileobj(uploaded_file, BUCKET_NAME, s3_key)
-                st.success("✅ File uploaded to S3 successfully!")
-            except Exception as e:
-                st.error(f"Upload failed: {e}")
-                st.stop()
+        page_texts, error = extract_text_from_pdf(BUCKET_NAME, s3_key)
+        if error:
+            st.error(error)
+            st.stop()
 
-            page_texts, error = extract_text_from_pdf(BUCKET_NAME, s3_key)
-            if error:
-                st.error(error)
-                st.stop()
-
-            records = []
-            for idx, page_text in enumerate(page_texts, start=1):
-                st.info(f"Processing Page {idx}...")
-                metadata = extract_metadata_llm(page_text, file_name)
-
+        records = []
+        all_chunks = []
+        
+        for idx, page_text in enumerate(page_texts, start=1):
+            st.info(f"Processing Page {idx} with LangChain Recursive Chunking...")
+            
+            # Use LangChain recursive chunking
+            chunks = recursive_chunk_with_langchain(page_text, idx, file_name)
+            
+            # Extract metadata from the page
+            metadata = extract_metadata_llm(page_text, file_name)
+            
+            # Process each chunk
+            for chunk in chunks:
+                chunk_text = chunk['text']
+                
+                # Generate embedding for chunk
+                vector = generate_embedding(chunk_text)
+                
+                # Create metadata record for chunk
                 metadata_record = {
                     "page_number": idx,
+                    "chunk_index": chunk['chunk_index'],
                     "sequenceno": idx,
                     "file_name": file_name,
                     "timestamp": datetime.utcnow().isoformat(),
-                    "text": page_text,
+                    "text": chunk_text,
+                    "vector": vector,
                     **metadata
                 }
-
-                vector = generate_embedding(page_text)
-                metadata_record["vector"] = vector
-
-                success, msg = store_vector_with_metadata(vector, metadata_record)
-                metadata_record["store_status"] = msg if success else f"Error: {msg}"
-
+                
+                # Store in S3 Vector Index
+                store_vector_with_metadata(vector, metadata_record)
+                
+                # Store in session chunks for current session retrieval
+                all_chunks.append(metadata_record)
                 records.append(metadata_record)
+        
+        # Update session state
+        st.session_state.session_chunks.extend(all_chunks)
+        st.session_state.metadata = records
+        st.session_state.processed_file = file_name
+        
+        # Add to uploaded files list
+        if file_name not in st.session_state.uploaded_files:
+            st.session_state.uploaded_files.append(file_name)
+        
+        st.success(f"✅ PDF processed with LangChain recursive chunking! Total chunks: {len(all_chunks)}")
 
-            st.session_state.metadata = records
-            st.success("✅ PDF processed, embeddings stored — ready for RAG chat!")
+# ------------------------------
+# Display chat history FIRST
+# ------------------------------
+st.subheader("💬 Chat with Policy GPT")
 
-            st.info(f"📄 Processed {len(records)} pages and stored {len([r for r in records if r.get('vector')])} vectors.")
+# Display uploaded files info
+if st.session_state.uploaded_files:
+    st.info(f"📄 Current session files: {', '.join(st.session_state.uploaded_files)}")
 
-    if st.session_state.metadata:
-        df = pd.DataFrame(st.session_state.metadata)
-        display_columns = [
-            "vector", "text", "sequenceno", "page_number",
-            "file_name", "policy_number", "policy_type",
-            "client_type", "client_name", "timestamp"
-        ]
-        display_columns = [c for c in display_columns if c in df.columns]
-        df = df[display_columns]
-        st.subheader("🧾 Extracted and Stored Metadata Records")
-        st.dataframe(df, use_container_width=True)
-        st.download_button(
-            "⬇️ Download Metadata CSV",
-            df.to_csv(index=False),
-            file_name="metadata_records.csv",
-            mime="text/csv"
-        )
+for chat in st.session_state.chat_history:
+    # User query box
+    with st.container():
+        st.markdown("**🧑 You:**")
+        st.info(chat['user'])
+    
+    # Bot reply box
+    with st.container():
+        st.markdown("**🤖 Policy GPT:**")
+        st.success(chat['bot'])
+    
+    st.divider()
 
-with right:
-    st.header("")
-    for chat in st.session_state.chat_history:
-        with st.chat_message(chat["role"]):
-            st.markdown(chat["content"])
+# ------------------------------
+# Query user input
+# ------------------------------
+query = st.chat_input("Ask a question about the uploaded PDF:")
 
-st.markdown("---")
-st.header("💬 Ask questions about the uploaded policy (RAG)")
+if query:
+    with st.spinner("🤔 Thinking..."):
+        # Use session-based retrieval
+        docs = retrieve_documents_from_session(query, st.session_state.session_chunks, top_k=10)
+        numbers = extract_numbers_from_docs(docs)
+        answer = generate_answer_from_session(query, docs, numbers, st.session_state.uploaded_files)
+    
+    # Add to chat history
+    st.session_state.chat_history.append({"user": query, "bot": answer})
+    
+    # Rerun to display the new message
+    st.rerun()
 
-user_input = st.chat_input("Ask something about your uploaded policies...")
-
-if user_input:
-    st.session_state.chat_history.append({"role": "user", "content": user_input})
-    with st.chat_message("user"):
-        st.markdown(user_input)
-
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            rag_response = generate_rag_response(model_choice, user_input)
-            st.markdown(rag_response)
-
-    st.session_state.chat_history.append({"role": "assistant", "content": rag_response})
-
-
+# Display metadata table (hidden when chat history exists)
+if st.session_state.metadata and len(st.session_state.chat_history) == 0:
+    st.subheader("🧾 Extracted Metadata Records")
+    df = pd.DataFrame(st.session_state.metadata)
+    display_columns = [
+        "sequenceno", "page_number", "chunk_index", "file_name",
+        "policy_number", "policy_type", "client_type",
+        "client_name", "timestamp", "vector","text"
+    ]
+    df = df[[c for c in display_columns if c in df.columns]]
+    st.dataframe(df, use_container_width=True)
+    st.download_button(
+        "⬇️ Download Metadata CSV",
+        df.to_csv(index=False),
+        file_name="metadata_records.csv",
+        mime="text/csv"
+    )

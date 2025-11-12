@@ -9,7 +9,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 import openai
 import random
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # ------------------------------
 # Load Environment Variables
@@ -580,3 +580,4 @@ if st.session_state.metadata and len(st.session_state.chat_history) == 0:
         file_name="metadata_records.csv",
         mime="text/csv"
     )
+

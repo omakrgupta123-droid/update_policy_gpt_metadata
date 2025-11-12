@@ -9,7 +9,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 import openai
 import random
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # ------------------------------
 # Load Environment Variables

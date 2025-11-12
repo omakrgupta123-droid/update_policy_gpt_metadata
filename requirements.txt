@@ -1,5 +1,4 @@
 boto3
-RecursiveCharacterTextSplitter
 openai
 requests
 pandas
@@ -9,6 +8,7 @@ streamlit
 python-dotenv
 tiktoken
 streamlit-option-menu
+
 
 
 
